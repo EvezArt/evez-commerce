@@ -8,7 +8,7 @@ import time
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 
 try:
     import stripe
@@ -35,7 +35,7 @@ if stripe and STRIPE_SECRET_KEY:
 
 class CheckoutRequest(BaseModel):
     product_id: str
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
 

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""EVEZ Commerce: public catalog plus optional Stripe Checkout.
+"""EVEZ Commerce control plane.
 
-Payments remain disabled unless STRIPE_SECRET_KEY is explicitly configured.
+Catalog is always available. Stripe Checkout and webhook processing fail closed
+unless the configured key, webhook secret, and COMMERCE_MODE agree.
 """
+import hashlib
+import json
 import os
+import sqlite3
 import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -12,25 +17,72 @@ from pydantic import BaseModel
 
 try:
     import stripe
-except ImportError:  # catalog-only mode remains runnable
+except ImportError:
     stripe = None
 
-app = FastAPI(title="EVEZ Commerce", version="1.1.0")
-
-PRODUCTS = [
-    {"id": "clawbreak-api", "name": "ClawBreak API Access", "price": 29.99, "interval": "month", "description": "Adversarial AI chat and task routing."},
-    {"id": "cognition-api", "name": "Cognition API Access", "price": 49.99, "interval": "month", "description": "AI-output forensics and risk scoring."},
-    {"id": "research-agent", "name": "Research Agent", "price": 19.99, "interval": "month", "description": "Structured research and evidence-pack generation."},
-    {"id": "digital-twin", "name": "Digital Twin Access", "price": 39.99, "interval": "month", "description": "Personal knowledge and workflow assistant."},
-    {"id": "mesh-network", "name": "Mesh Network Seat", "price": 25.00, "interval": "month", "description": "Agent coordination and diagnostics."},
-    {"id": "guard-security", "name": "Guard Security Monitor", "price": 14.99, "interval": "month", "description": "Service health and abuse monitoring."},
-]
-PRODUCT_BY_ID = {product["id"]: product for product in PRODUCTS}
+BASE = Path(os.getenv("COMMERCE_BASE", Path(__file__).resolve().parent))
+CATALOG_PATH = Path(os.getenv("CATALOG_PATH", BASE / "catalog.json"))
+DB_PATH = Path(os.getenv("COMMERCE_DB", BASE / "commerce.db"))
+COMMERCE_MODE = os.getenv("COMMERCE_MODE", "catalog").lower()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8904")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8904").rstrip("/")
+
+with CATALOG_PATH.open(encoding="utf-8") as catalog_file:
+    CATALOG = json.load(catalog_file)
+PRODUCTS = CATALOG["products"]
+PRODUCT_BY_ID = {product["id"]: product for product in PRODUCTS}
+
 if stripe and STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
+
+
+def configured_stripe_mode() -> str:
+    if not STRIPE_SECRET_KEY:
+        return "unconfigured"
+    if STRIPE_SECRET_KEY.startswith("sk_live_"):
+        return "live"
+    if STRIPE_SECRET_KEY.startswith("sk_test_"):
+        return "test"
+    return "unknown"
+
+
+def stripe_ready() -> bool:
+    key_mode = configured_stripe_mode()
+    if not stripe or key_mode in {"unconfigured", "unknown"}:
+        return False
+    if COMMERCE_MODE not in {"test", "live"} or COMMERCE_MODE != key_mode:
+        return False
+    return bool(STRIPE_WEBHOOK_SECRET)
+
+
+def db() -> sqlite3.Connection:
+    connection = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("""CREATE TABLE IF NOT EXISTS stripe_events (
+        event_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        processed INTEGER NOT NULL DEFAULT 0
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS fulfillment_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        product_id TEXT,
+        customer_email TEXT,
+        status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+    connection.commit()
+    return connection
+
+
+DB = db()
+app = FastAPI(title="EVEZ Commerce", version="1.2.0")
 
 
 class CheckoutRequest(BaseModel):
@@ -42,11 +94,16 @@ class CheckoutRequest(BaseModel):
 
 @app.get("/health")
 def health():
+    key_mode = configured_stripe_mode()
     return {
         "status": "ok",
         "version": app.version,
         "service": "evez-commerce",
-        "payments": "enabled" if stripe and STRIPE_SECRET_KEY else "disabled",
+        "commerce_mode": COMMERCE_MODE,
+        "stripe_key_mode": key_mode,
+        "stripe_ready": stripe_ready(),
+        "fulfillment": "manual_review_until_adapter_verified",
+        "product_count": len(PRODUCTS),
         "ts": int(time.time()),
     }
 
@@ -62,7 +119,12 @@ def root():
 
 @app.get("/products")
 def products():
-    return {"products": PRODUCTS, "count": len(PRODUCTS), "mrr_potential": round(sum(p["price"] for p in PRODUCTS), 2)}
+    return {
+        "currency": CATALOG["currency"],
+        "products": PRODUCTS,
+        "count": len(PRODUCTS),
+        "mrr_potential": round(sum(product["price_cents"] for product in PRODUCTS) / 100, 2),
+    }
 
 
 @app.get("/products/{product_id}")
@@ -78,34 +140,36 @@ def checkout(request: CheckoutRequest):
     product = PRODUCT_BY_ID.get(request.product_id)
     if not product:
         raise HTTPException(404, "product not found")
-    if not stripe or not STRIPE_SECRET_KEY:
-        raise HTTPException(503, "payments are not configured; catalog mode is active")
-    mode = "subscription" if product["interval"] == "month" else "payment"
+    if not stripe_ready():
+        raise HTTPException(503, "Stripe is not configured for the selected commerce mode")
     params = {
-        "mode": mode,
-        "line_items": [{
-            "price_data": {
-                "currency": "usd",
-                "product_data": {"name": product["name"], "description": product["description"]},
-                "unit_amount": round(product["price"] * 100),
-                **({"recurring": {"interval": product["interval"]}} if mode == "subscription" else {}),
-            },
-            "quantity": 1,
-        }],
+        "mode": "subscription" if product["interval"] == "month" else "payment",
+        "line_items": [{"price_data": {"currency": CATALOG["currency"], "product_data": {"name": product["name"], "description": product["description"]}, "unit_amount": product["price_cents"], "recurring": {"interval": product["interval"]}}, "quantity": 1}],
         "success_url": request.success_url or f"{PUBLIC_BASE_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
         "cancel_url": request.cancel_url or f"{PUBLIC_BASE_URL}/cancel",
-        "metadata": {"product_id": product["id"]},
+        "metadata": {"product_id": product["id"], "commerce_mode": COMMERCE_MODE},
     }
     if request.email:
-        params["customer_email"] = str(request.email)
+        params["customer_email"] = request.email
     session = stripe.checkout.Session.create(**params)
-    return {"checkout_url": session.url, "session_id": session.id, "product_id": product["id"]}
+    return {"checkout_url": session.url, "session_id": session.id, "product_id": product["id"], "mode": COMMERCE_MODE}
+
+
+def enqueue_fulfillment(event_id: str, event_type: str, event_object: dict) -> None:
+    metadata = event_object.get("metadata") or {}
+    product_id = metadata.get("product_id") or metadata.get("evez_product_id")
+    customer_details = event_object.get("customer_details") or {}
+    email = customer_details.get("email") or event_object.get("customer_email")
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    DB.execute("""INSERT OR IGNORE INTO fulfillment_queue
+        (event_id, product_id, customer_email, status, reason, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)""", (event_id, product_id, email, "manual_review", f"verified {event_type}; no adapter enabled", now, now))
 
 
 @app.post("/webhooks/stripe")
 async def stripe_webhook(request: Request):
-    if not stripe or not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(503, "Stripe webhooks are not configured")
+    if not stripe_ready():
+        raise HTTPException(503, "Stripe webhook processing is not configured for the selected commerce mode")
     payload = await request.body()
     signature = request.headers.get("stripe-signature")
     if not signature:
@@ -116,14 +180,24 @@ async def stripe_webhook(request: Request):
         raise HTTPException(400, "invalid payload") from exc
     except stripe.error.SignatureVerificationError as exc:
         raise HTTPException(400, "invalid signature") from exc
-    # Payment fulfillment must be implemented per product; never grant access merely
-    # because a client called this endpoint. The event is verified by Stripe first.
-    return {"received": True, "event_id": event["id"], "type": event["type"]}
+
+    event_id = event["id"]
+    event_type = event["type"]
+    digest = hashlib.sha256(payload).hexdigest()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    inserted = DB.execute("INSERT OR IGNORE INTO stripe_events (event_id, event_type, payload_sha256, received_at) VALUES (?, ?, ?, ?)", (event_id, event_type, digest, now)).rowcount
+    if inserted:
+        event_object = event.get("data", {}).get("object", {})
+        if event_type in {"checkout.session.completed", "invoice.paid", "customer.subscription.updated", "customer.subscription.deleted", "charge.refunded", "invoice.payment_failed"}:
+            enqueue_fulfillment(event_id, event_type, event_object)
+        DB.execute("UPDATE stripe_events SET processed = 1 WHERE event_id = ?", (event_id,))
+        DB.commit()
+    return {"received": True, "event_id": event_id, "type": event_type, "duplicate": not bool(inserted)}
 
 
 @app.get("/success")
 def success(session_id: Optional[str] = None):
-    return {"status": "payment_received", "session_id": session_id, "message": "Thank you. Fulfillment will follow after webhook verification."}
+    return {"status": "payment_received", "session_id": session_id, "message": "Payment confirmation is processed by the verified Stripe webhook."}
 
 
 @app.get("/cancel")

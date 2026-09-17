@@ -1,0 +1,54 @@
+{
+    "version": 1,
+    "currency": "usd",
+    "products": [
+        {
+            "id": "clawbreak-api",
+            "name": "ClawBreak API Access",
+            "price_cents": 2999,
+            "interval": "month",
+            "description": "Adversarial AI chat and task routing.",
+            "fulfillment": "manual_review"
+        },
+        {
+            "id": "cognition-api",
+            "name": "Cognition API Access",
+            "price_cents": 4999,
+            "interval": "month",
+            "description": "AI-output forensics and risk scoring.",
+            "fulfillment": "manual_review"
+        },
+        {
+            "id": "research-agent",
+            "name": "Research Agent",
+            "price_cents": 1999,
+            "interval": "month",
+            "description": "Structured research and evidence-pack generation.",
+            "fulfillment": "manual_review"
+        },
+        {
+            "id": "digital-twin",
+            "name": "Digital Twin Access",
+            "price_cents": 3999,
+            "interval": "month",
+            "description": "Personal knowledge and workflow assistant.",
+            "fulfillment": "manual_review"
+        },
+        {
+            "id": "mesh-network",
+            "name": "Mesh Network Seat",
+            "price_cents": 2500,
+            "interval": "month",
+            "description": "Agent coordination and diagnostics.",
+            "fulfillment": "manual_review"
+        },
+        {
+            "id": "guard-security",
+            "name": "Guard Security Monitor",
+            "price_cents": 1499,
+            "interval": "month",
+            "description": "Service health and abuse monitoring.",
+            "fulfillment": "manual_review"
+        }
+    ]
+}

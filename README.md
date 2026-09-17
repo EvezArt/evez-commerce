@@ -1,17 +1,10 @@
 # EVEZ Commerce
 
-A small, installable commerce service for EVEZ digital products. It exposes a public product catalog immediately and enables Stripe Checkout only when payment credentials are explicitly configured.
+EVEZ Commerce is the small control plane behind the EVEZ catalog. It keeps a normalized product registry, exposes a public catalog, creates Stripe Checkout Sessions when explicitly configured, verifies Stripe webhook signatures, deduplicates events, and queues fulfillment for manual review until a product-specific adapter has been tested.
 
-## Products
+## Product registry
 
-| Product | Price | Delivery status |
-|---|---:|---|
-| ClawBreak API Access | $29.99/month | Configure fulfillment target |
-| Cognition API Access | $49.99/month | Configure fulfillment target |
-| Research Agent | $19.99/month | Configure fulfillment target |
-| Digital Twin Access | $39.99/month | Configure fulfillment target |
-| Mesh Network Seat | $25.00/month | Configure fulfillment target |
-| Guard Security Monitor | $14.99/month | Configure fulfillment target |
+The canonical catalog is [`catalog.json`](catalog.json). It is shared by the API and should be copied into the landing-page build as data rather than retyped in multiple places.
 
 ## Run locally
 
@@ -19,36 +12,40 @@ A small, installable commerce service for EVEZ digital products. It exposes a pu
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-python server.py
+COMMERCE_MODE=catalog python server.py
 ```
 
-The service listens on `http://127.0.0.1:8904` by default. For a public deployment, put it behind HTTPS and an access-controlled reverse proxy.
+Catalog mode requires no payment credentials and serves on `http://127.0.0.1:8904` by default.
+
+## Stripe modes
+
+The service fails closed unless the selected mode agrees with the secret-key prefix:
+
+- `COMMERCE_MODE=catalog`: catalog only; checkout and webhooks return HTTP 503.
+- `COMMERCE_MODE=test` with `sk_test_...` and a test webhook secret: test Checkout and webhooks.
+- `COMMERCE_MODE=live` with `sk_live_...` and a live webhook secret: live Checkout and webhooks.
+
+Never place keys in Git or client-side code. Set `PUBLIC_BASE_URL` to the HTTPS origin used in Checkout redirects.
+
+```bash
+COMMERCE_MODE=test \
+STRIPE_SECRET_KEY=sk_test_... \
+STRIPE_WEBHOOK_SECRET=whsec_... \
+PUBLIC_BASE_URL=https://catalog.example \
+python server.py
+```
 
 ## API
 
-```bash
-curl http://localhost:8904/health
-curl http://localhost:8904/products
-curl http://localhost:8904/products/cognition-api
-```
+- `GET /health` reports the selected mode, detected key mode, Stripe readiness, and fulfillment state without exposing secrets.
+- `GET /products` returns the normalized catalog.
+- `POST /checkout` accepts `{ "product_id": "cognition-api", "email": "buyer@example.com" }`.
+- `POST /webhooks/stripe` verifies `Stripe-Signature`, writes an idempotent event ledger, and queues recognized events for fulfillment review.
 
-`POST /checkout` accepts `{ "product_id": "cognition-api", "email": "buyer@example.com" }`. It returns HTTP 503 in catalog-only mode and creates a Stripe Checkout Session only when both `STRIPE_SECRET_KEY` and the `stripe` package are configured.
+## Fulfillment boundary
 
-`POST /webhooks/stripe` verifies `Stripe-Signature` using `STRIPE_WEBHOOK_SECRET`. It acknowledges verified events but deliberately does not grant access automatically until product-specific fulfillment is configured.
+The webhook handler deliberately does not grant access automatically. Each product needs a verified adapter and a tested revocation/refund path before its queue status can move from `manual_review` to `provisioned`. This prevents false fulfillment from client redirects, duplicate webhooks, or unsupported product claims.
 
-## Payment configuration
+## Low-cost operation
 
-Set these environment variables only on the server, never in Git:
-
-```bash
-export STRIPE_SECRET_KEY=sk_test_or_sk_live_...
-export STRIPE_WEBHOOK_SECRET=whsec_...
-export PUBLIC_BASE_URL=https://your-domain.example
-python server.py
-```
-
-Use Stripe test mode first. Do not accept live payments until the product fulfillment behavior, refund path, support contact, and privacy notice have been verified.
-
-## Safety and operational notes
-
-Catalog mode is safe to deploy without payment credentials. The service does not claim that a payment succeeded based on a client redirect; payment confirmation must come from a verified Stripe webhook. Add authentication, rate limiting, persistent order records, and fulfillment handlers before treating it as production-ready.
+Keep deterministic work in the service or a small worker: catalog validation, Stripe reconciliation once or twice daily, UTM generation, link checks, and performance checks. Use OpenClaw judgment only for exception review, positioning decisions, and weekly campaign synthesis. Do not poll Stripe every few minutes or regenerate the whole catalog on every run.
